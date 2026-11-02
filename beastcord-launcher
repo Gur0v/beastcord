@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${HOME:?HOME must be set}/.local/bin/beastcord" --launch "$@"

@@ -1,0 +1,631 @@
+#!/usr/bin/env -S python3 -I
+
+import errno
+import fcntl
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+class LaunchError(RuntimeError):
+    pass
+
+
+def command(args):
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LaunchError("cannot query desktop/processes: " + str(exc)) from exc
+
+
+def processes():
+
+
+    rows = command(["ps", "-axww", "-o", "uid=", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "comm=", "-o", "args="])
+    result = {}
+    for row in rows.splitlines():
+        fields = row.split(None, 9)
+        if len(fields) != 10:
+            raise LaunchError("unexpected ps output; refusing process recovery")
+        uid, pid, parent = map(int, fields[:3])
+        if uid == os.getuid():
+            result[pid] = (parent, " ".join(fields[3:8]), fields[8], fields[9])
+    if result:
+        query = subprocess.run(["procstat", "-b", *map(str, result)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3)
+        executables = query.stdout
+        if not executables.startswith("  PID "):
+            raise LaunchError("cannot query kernel executable paths; refusing process recovery")
+        for line in executables.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and int(parts[0]) in result and parts[3].startswith("/"):
+                pid = int(parts[0])
+                parent, birth, _, args = result[pid]
+                result[pid] = (parent, birth, parts[3], args)
+    return result
+
+
+def clients(rows, base):
+    seeds = {pid for pid, (_, _, comm, args) in rows.items()
+             if os.path.basename(comm).lower() in ("discord", "discordcanary", "discordptb", "discordhelper")
+             or (os.path.basename(comm) == "chrome_crashpad_handler" and base + "/versions/" in args)}
+
+
+    while True:
+        more = {pid for pid, row in rows.items() if row[0] in seeds}
+        if more <= seeds:
+            return {pid: rows[pid] for pid in seeds}
+        seeds |= more
+
+
+def windows(pids):
+    deadline = time.monotonic() + 5
+    root = command(["xprop", "-root", "_NET_CLIENT_LIST"])
+    if "_NET_CLIENT_LIST(WINDOW)" in root:
+        ids = re.findall(r"0x[0-9a-fA-F]+", root)
+    else:
+
+
+
+        tree = command(["xwininfo", "-root", "-tree"])
+        if "xwininfo: Window id:" not in tree or not re.search(r"\d+ (?:child|children)\b", tree):
+            raise LaunchError("cannot enumerate X11 windows; install xwininfo with: pkg install xwininfo")
+        ids = re.findall(r"^\s+(0x[0-9a-fA-F]+)\s", tree, re.M)
+    for window in dict.fromkeys(ids):
+        if time.monotonic() >= deadline:
+            raise LaunchError("X11 window enumeration exceeded five-second budget")
+        props = command(["xprop", "-id", window, "WM_CLASS", "_NET_WM_PID"])
+        cls = next((line for line in props.splitlines() if line.startswith("WM_CLASS(")), "")
+        match = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", props)
+        if re.search(r"discord|beastcord", cls, re.I) or (match and int(match[1]) in pids):
+            return window
+    return None
+
+
+def identity(row):
+
+    return row[1:]
+
+
+def terminate(snapshot, check_window=True):
+    for sig, delay in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
+        current = processes()
+        if check_window and windows(set(snapshot)):
+            raise LaunchError("a Discord window appeared; recovery cancelled")
+        for pid, previous in snapshot.items():
+            if pid == os.getpid() or pid not in current or identity(current[pid]) != identity(previous):
+                continue
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        time.sleep(delay)
+
+
+def lockfile(path):
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise LaunchError("refusing nonregular lock file")
+    return fd
+
+
+def acquire(fd, timeout=0):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            if time.monotonic() >= deadline:
+                raise LaunchError("another launch or maintenance operation still owns the lock; no duplicate client started")
+            time.sleep(0.1)
+
+
+def run(base, log, host, args, child_env=None):
+    launch_lock = lockfile(os.path.join(base, ".launch-lock"))
+    acquire(launch_lock)
+    x11 = os.environ.get("BEASTCORD_OZONE_PLATFORM", "x11") == "x11" and bool(os.environ.get("DISPLAY"))
+    stale = clients(processes(), base)
+    if stale:
+        if not x11:
+            raise LaunchError("existing Discord processes found; safe automatic recovery needs X11 and xprop")
+        window = windows(set(stale))
+        if window:
+            print("beastcord: Discord already has a window; keeping the existing client", flush=True)
+
+            try:
+                subprocess.run(["wmctrl", "-ia", window], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            os.close(launch_lock)
+            return 0
+        print("beastcord: no Discord window; allowing 10 seconds for startup", flush=True)
+        for _ in range(10):
+            time.sleep(1)
+            if windows(set(stale)):
+                print("beastcord: existing Discord window appeared; keeping client", flush=True)
+                return 0
+        current = clients(processes(), base)
+        stale = {pid: row for pid, row in stale.items()
+                 if pid in current and identity(current[pid]) == identity(row)}
+        print("beastcord: recovering windowless clients: " + ",".join(map(str, stale)), flush=True)
+        terminate(stale)
+    lifetime_lock = lockfile(os.path.join(base, ".lock"))
+    acquire(lifetime_lock, 5)
+
+
+    for name in (log, log + ".1"):
+        if os.path.lexists(name) and (os.path.islink(name) or not os.path.isfile(name)):
+            raise LaunchError("refusing nonregular log path")
+    if os.path.exists(log):
+        os.replace(log, log + ".1")
+    output = open(log, "wb")
+    child = subprocess.Popen([host, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True, env=child_env)
+    os.close(launch_lock)
+    stop_at = None
+    def forward(sig, frame):
+        nonlocal stop_at
+        stop_at = time.monotonic() + 3
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+    old_handlers = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    selector = selectors.DefaultSelector()
+    selector.register(child.stdout, selectors.EVENT_READ)
+    os.set_blocking(child.stdout.fileno(), False)
+    start = time.monotonic()
+    ready = False
+    probe_at = start
+    exited_at = None
+    size = 0
+    try:
+        while True:
+            now = time.monotonic()
+            rc = child.poll()
+            if rc is not None:
+                exited_at = exited_at or now
+
+
+                if now - exited_at >= 1:
+                    return 143 if stop_at is not None else (rc if rc >= 0 else 128 - rc)
+            if stop_at is not None and now >= stop_at:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait(timeout=5)
+                return 143
+            if x11 and not ready and now >= probe_at and rc is None:
+                probe_at = now + 2
+                try:
+                    ready = bool(windows(set(clients(processes(), base))))
+                except LaunchError as exc:
+                    print("beastcord: cannot safely monitor startup: " + str(exc) + "; stopping this launch rather than waiting indefinitely", file=sys.stderr)
+                    forward(signal.SIGTERM, None)
+                    x11 = False
+                if ready:
+                    print("beastcord: Discord window detected", flush=True)
+            if x11 and not ready and now - start >= 90 and rc is None:
+                print("beastcord: no window after 90 seconds; stopping this launch. Inspect startup.log", file=sys.stderr)
+                forward(signal.SIGTERM, None)
+                x11 = False
+            for key, _ in selector.select(0.2):
+                chunk = os.read(key.fd, 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if size + len(chunk) > 512 * 1024:
+                    output.close()
+                    os.replace(log, log + ".1")
+                    output = open(log, "wb")
+                    size = 0
+                output.write(chunk)
+                output.flush()
+                size += len(chunk)
+    finally:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if child.poll() is None:
+            child.wait(timeout=5)
+        selector.close()
+        child.stdout.close()
+        output.close()
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        os.close(lifetime_lock)
+
+import argparse
+import contextlib
+from pathlib import Path, PurePosixPath
+import platform
+import shutil
+import tarfile
+import tempfile
+import uuid
+
+MANAGED_BY = "beastcord"
+LEGACY_MARKER = chr(35) + " Managed by beastcord"
+
+
+def require(condition, message):
+    if not condition:
+        raise LaunchError(message)
+
+
+def read_host_path(root):
+    root = Path(root).resolve()
+    value = (root / "host-path").read_text().strip()
+    require(re.fullmatch(r"bootstrap-profile/app-[0-9]+\.[0-9]+\.[0-9]+", value), "invalid managed host path")
+    host = root / value
+    require(host.resolve() == host and (host / "resources/app.asar").is_file(), "managed host escapes version or is incomplete")
+    return value
+
+
+def validate_archive(archive, dest):
+    dest = Path(dest)
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        require(len(members) <= 100000, "archive has too many entries")
+        seen = set()
+        total = 0
+        for member in members:
+            path = PurePosixPath(member.name)
+            require(not path.is_absolute() and ".." not in path.parts and path.parts and path.parts[0] == "Discord" and "\\" not in member.name and not any(ord(c) < 32 for c in member.name), "unsafe archive path")
+            require((member.isdir() or member.isfile()) and path not in seen, "archive links, special files or duplicate paths rejected")
+            seen.add(path)
+            total += member.size
+            require(total <= 4 * 1024**3 and member.size >= 0, "archive exceeds size limit")
+        for member in members:
+            path = dest.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with source.extractfile(member) as src, path.open("xb") as out:
+                    shutil.copyfileobj(src, out)
+                path.chmod(0o700 if member.mode & 0o111 else 0o600)
+    app = dest / "Discord"
+    if not (app / "Discord").exists() and (app / "updater_bootstrap").is_file():
+        return False
+    for name in ("Discord", "resources/app.asar"):
+        path = app / name
+        require(path.is_file() and not path.is_symlink(), "archive lacks standalone host: " + name)
+    with (app / "Discord").open("rb") as stream:
+        require(stream.read(5) == b"\x7fELF\x02", "host is not a 64-bit ELF executable")
+    require(os.access(app / "Discord", os.X_OK), "host is not executable")
+    return True
+
+
+@contextlib.contextmanager
+def held_lock(path):
+    fd = lockfile(str(path))
+    try:
+        acquire(fd)
+        yield
+    finally:
+        os.close(fd)
+
+
+def checked_run(args, **kwargs):
+    return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def atomic_write(path, data, mode=0o600):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+
+DRM_COMPAT_SOURCE = '#define _GNU_SOURCE\n#include <sys/stat.h>\n#include <sys/sysmacros.h>\n#include <dlfcn.h>\n#include <errno.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\nstruct drm_device {char **nodes;int available_nodes;int bustype;void *businfo;void *deviceinfo;};\nstatic void *symbol(const char *name){void *lib=dlopen("libdrm.so.2",RTLD_LAZY);return lib?dlsym(lib,name):NULL;}\nstatic int render_minor(int fd){struct stat s;if(fstat(fd,&s)||!S_ISCHR(s.st_mode)||major(s.st_rdev)!=226)return -1;unsigned n=minor(s.st_rdev);return n>=128&&n<192?(int)n:-1;}\nstatic void add_render(struct drm_device *d){if(!d||!(d->available_nodes&1)||(d->available_nodes&4)||!d->nodes[0]||!d->nodes[2])return;unsigned n;char path[64];struct stat s;if(sscanf(d->nodes[0],"/dev/dri/card%u",&n)!=1||n>=64)return;snprintf(path,sizeof(path),"/dev/dri/renderD%u",128+n);if(stat(path,&s)||!S_ISCHR(s.st_mode)||major(s.st_rdev)!=226||minor(s.st_rdev)!=128+n)return;strcpy(d->nodes[2],path);d->available_nodes|=4;}\nint drmGetNodeTypeFromFd(int fd){if(render_minor(fd)>=0)return 2;int(*real)(int)=symbol("drmGetNodeTypeFromFd");return real?real(fd):-1;}\nint drmGetDevice2(int fd,unsigned flags,struct drm_device **device){int(*real)(int,unsigned,struct drm_device**)=symbol("drmGetDevice2");if(!real)return -ENODEV;int r=real(fd,flags,device);int n=render_minor(fd);if(r<0&&n>=0){char p[64];snprintf(p,sizeof(p),"/dev/dri/card%d",n-128);int card=open(p,O_RDWR|O_CLOEXEC);if(card>=0){r=real(card,flags,device);close(card);if(!r&&device)add_render(*device);}}return r;}\nint drmGetDevices2(unsigned flags,struct drm_device **devices,int max){int(*real)(unsigned,struct drm_device**,int)=symbol("drmGetDevices2");if(!real)return -ENODEV;int r=real(flags,devices,max);if(devices)for(int i=0;i<r&&i<max;i++)add_render(devices[i]);return r;}\nchar *drmGetRenderDeviceNameFromFd(int fd){struct stat s;if(!fstat(fd,&s)&&S_ISCHR(s.st_mode)&&major(s.st_rdev)==226){unsigned n=minor(s.st_rdev);if(n<64)n+=128;if(n>=128&&n<192){char p[64];snprintf(p,sizeof(p),"/dev/dri/renderD%u",n);if(!access(p,R_OK|W_OK))return strdup(p);}}char*(*real)(int)=symbol("drmGetRenderDeviceNameFromFd");return real?real(fd):NULL;}\n'
+
+def drm_compatibility(state):
+    if platform.system() != "FreeBSD" or os.environ.get("BEASTCORD_SOFTWARE_RENDERING", "0") == "1":
+        return None
+    root = Path("/compat/linux")
+    missing = [node for node in (root / "dev/dri").glob("renderD*") if node.name[7:].isdigit() and not (root / "sys/class/drm" / node.name).exists()]
+    if not missing:
+        return None
+    compiler = root / "usr/bin/gcc"
+    require(compiler.is_file(), "Linuxulator render-node sysfs is incomplete; hardware compatibility requires /compat/linux/usr/bin/gcc (Linux compiler). No software fallback selected.")
+    import hashlib
+    key = hashlib.sha256(DRM_COMPAT_SOURCE.encode()).hexdigest()[:20]
+    cache = state / "graphics"
+    cache.mkdir(mode=0o700, exist_ok=True)
+    require(not cache.is_symlink() and cache.stat().st_uid == os.getuid(), "unsafe graphics cache directory")
+    library = cache / ("drm-" + key + ".so")
+    if library.exists():
+        require(not library.is_symlink() and library.is_file() and library.stat().st_uid == os.getuid() and library.read_bytes()[:5] == b"\x7fELF\x02", "invalid graphics compatibility cache")
+    else:
+        with tempfile.TemporaryDirectory(prefix=".build-", dir=cache) as temporary:
+            source = Path(temporary) / "drm.c"
+            compiled = Path(temporary) / "drm.so"
+            source.write_text(DRM_COMPAT_SOURCE)
+            checked_run([str(compiler), "-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o", str(compiled), str(source), "-ldl"], timeout=60)
+            compiled.chmod(0o700)
+            os.replace(compiled, library)
+    print("Using app-local Linuxulator DRM render-node compatibility", flush=True)
+    return str(library)
+
+class Manager:
+    def __init__(self):
+        home = os.environ.get("HOME", "")
+        require(home, "HOME must be set")
+        self.home = Path(home)
+        self.base = Path(os.environ.get("XDG_DATA_HOME") or self.home / ".local/share") / "beastcord"
+        self.state = Path(os.environ.get("XDG_STATE_HOME") or self.home / ".local/state") / "beastcord"
+        self.bin = self.home / ".local/bin"
+        require(all(p.is_absolute() for p in (self.home, self.base, self.state)), "HOME and XDG paths must be absolute")
+
+    def prerequisites(self):
+        require(platform.system() == "FreeBSD" and platform.machine() == "amd64", "FreeBSD amd64 is required")
+        require(os.getuid() != 0, "run as your desktop user, not root")
+        require(Path("/compat/linux/proc/version").is_file() and Path("/compat/linux/sys/kernel").is_dir() and Path("/compat/linux/dev/shm").is_dir(), "Linuxulator mounts missing; run --doctor")
+
+    def prepare(self):
+        for path in (self.base, self.state):
+            require(not path.is_symlink(), "managed directories must not be symlinks")
+            path.mkdir(parents=True, exist_ok=True)
+        marker = self.base / ".managed-by-beastcord"
+        if marker.exists() or marker.is_symlink():
+            require(marker.is_file() and not marker.is_symlink(), "invalid ownership marker")
+        else:
+            require(not any(self.base.iterdir()), "refusing nonempty unmanaged data directory")
+            marker.touch()
+
+    def version(self, link="current", check_host=True):
+        path = self.base / link
+        require(path.is_symlink(), "no " + link + " version; run --install")
+        target = os.readlink(path)
+        require(re.fullmatch(r"versions/v-[a-zA-Z0-9.-]+", target), "invalid managed version link")
+        root = self.base / target
+        require(root.resolve() == root and (root / ".managed-by-beastcord").is_file(), "version ownership marker missing or path escapes managed tree")
+        hostdir = "Discord"
+        if check_host:
+            if (root / "host-path").is_file():
+                hostdir = read_host_path(root)
+            else:
+                require(not (root / "bootstrap-profile").is_dir(), "legacy bootstrap layout; close clients and run the source manager --update")
+            host = root / hostdir / "Discord"
+            require(host.is_file() and not host.is_symlink() and os.access(host, os.X_OK), "version has no executable host")
+        return target, hostdir
+
+    def atomic_link(self, target, name):
+        temporary = self.base / ("." + name + "-" + uuid.uuid4().hex)
+        try:
+            temporary.symlink_to(target)
+            os.replace(temporary, self.base / name)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def activate(self, target):
+        if (self.base / "current").is_symlink():
+            self.atomic_link(os.readlink(self.base / "current"), "previous")
+        self.atomic_link(target, "current")
+
+    def rollback(self):
+        old, _ = self.version()
+        target, _ = self.version("previous")
+        self.atomic_link(old, "previous")
+        self.atomic_link(target, "current")
+        print("Activated " + target + "; profiles and Discord self-updates were not rolled back.")
+
+    def install_manager(self, target, hostdir):
+        self.bin.mkdir(parents=True, exist_ok=True)
+        installed = self.bin / "beastcord"
+        if installed.exists() or installed.is_symlink():
+            require(not installed.is_symlink() and installed.is_file(), "refusing unmanaged ~/.local/bin/beastcord")
+            old = installed.read_text()
+            require(LEGACY_MARKER in old.splitlines() or 'MANAGED_BY = "beastcord"' in old.splitlines(), "refusing unmanaged ~/.local/bin/beastcord")
+        desktop = self.base.parent / "applications/beastcord.desktop"
+        desktop.parent.mkdir(parents=True, exist_ok=True)
+        if desktop.exists() or desktop.is_symlink():
+            require(not desktop.is_symlink() and desktop.is_file() and LEGACY_MARKER in desktop.read_text().splitlines(), "refusing unmanaged desktop entry")
+        require(not any(c in str(self.bin) + str(self.base) for c in ('"', '`', '$', '\\', '\n', '\r', '%')), "desktop paths contain unsupported characters")
+        content = "\n".join((LEGACY_MARKER, "[Desktop Entry]", "Type=Application", "Name=beastcord", f'Exec="{self.bin}/beastcord" --launch %U', f"Icon={self.base}/{target}/{hostdir}/discord.png", "Terminal=false", "Categories=Network;InstantMessaging;", "MimeType=x-scheme-handler/discord;", ""))
+        atomic_write(installed, Path(__file__).resolve().read_bytes(), 0o700)
+        atomic_write(desktop, content.encode())
+
+    def maintain(self, action, archive=None, mod=None):
+        if action == "rollback":
+            self.rollback()
+            return
+        if action == "install":
+            require(not os.path.lexists(self.base / "current"), "already installed; use --update")
+            target, hostdir = None, "Discord"
+        else:
+            target, hostdir = self.version(check_host=action != "update")
+        if mod is None:
+            mod = action == "install" or (self.base / target / "equicord").is_file()
+        if action == "repair-equicord":
+            require((self.base / target / "equicord").is_file(), "current version is vanilla; use --update --equicord to opt in")
+            mod = True
+        versions = self.base / "versions"
+        require(not versions.is_symlink(), "versions directory must not be a symlink")
+        versions.mkdir(exist_ok=True)
+        stage = versions / ("v-" + uuid.uuid4().hex)
+        stage.mkdir(mode=0o700)
+        retained = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="beastcord.") as temporary:
+                work = Path(temporary)
+                for name in ("download", "extract", "equicord", "run"):
+                    (work / name).mkdir()
+                hostdir = "Discord" if action != "repair-equicord" else hostdir
+                if action == "repair-equicord":
+                    root = self.base / target
+                    if (root / "host-path").is_file():
+                        shutil.copytree(root / "bootstrap-profile", stage / "bootstrap-profile", symlinks=True)
+                        (stage / "host-path").write_text(hostdir + "\n")
+                        read_host_path(stage)
+                    else:
+                        shutil.copytree(root / "Discord", stage / "Discord", symlinks=True)
+                else:
+                    download = work / "download/discord.tar.gz"
+                    if archive:
+                        require(Path(archive).is_file(), "archive must be a regular file")
+                        shutil.copyfile(archive, download)
+                    else:
+                        checked_run(["fetch", "-T", "120", "-o", download, "https://discord.com/api/download?platform=linux&format=tar.gz"], timeout=130)
+                    if validate_archive(download, work / "extract"):
+                        shutil.move(work / "extract/Discord", stage / "Discord")
+                    else:
+                        (stage / "bootstrap-profile").mkdir()
+                        print("Explicitly running the official bootstrap into a new staged profile.")
+                        env = dict(os.environ)
+                        for key in ("ELECTRON_RUN_AS_NODE", "NODE_OPTIONS", "NODE_PATH"):
+                            env.pop(key, None)
+                        result = checked_run([work / "extract/Discord/updater_bootstrap", "--no-zenity", stage / "bootstrap-profile", "stable", "https://updates.discord.com/"], cwd=work / "run", env=env, text=True, stdout=subprocess.PIPE, timeout=300)
+                        appname = result.stdout.strip()
+                        require(re.fullmatch(r"app-[0-9]+\.[0-9]+\.[0-9]+", appname), "unexpected bootstrap output")
+                        hostdir = "bootstrap-profile/" + appname
+                        (stage / "host-path").write_text(hostdir + "\n")
+                        read_host_path(stage)
+                        require((stage / "bootstrap-profile/installer.db").is_file() and (stage / hostdir / "modules").is_dir(), "bootstrap modules or installer metadata missing")
+                if mod:
+                    print("Explicitly downloading and executing Equilotl to modify the staged host.")
+                    installer = work / "equicord/installer"
+                    checked_run(["fetch", "-T", "120", "-o", installer, "https://github.com/Equicord/Equilotl/releases/latest/download/EquilotlCli-linux"], timeout=130)
+                    installer.chmod(0o700)
+                    checked_run([installer, "-install", "-location", stage / hostdir], cwd=work / "run", timeout=300)
+                    (stage / "equicord").touch()
+                host = stage / hostdir / "Discord"
+                require(host.is_file() and not host.is_symlink() and os.access(host, os.X_OK), "staged host missing")
+                (stage / ".managed-by-beastcord").touch()
+                next_version = "versions/" + stage.name
+                self.install_manager(next_version, hostdir)
+                retained = True
+                self.activate(next_version)
+                print(f"Activated {next_version}. Command: {self.bin}/beastcord")
+                print("Previous versions retained. Rollback does not undo Discord module/host self-updates or profile changes.")
+        finally:
+            if not retained:
+                shutil.rmtree(stage)
+
+    def launch(self, args):
+        target, hostdir = self.version()
+        platform_name = os.environ.get("BEASTCORD_OZONE_PLATFORM", "x11")
+        require(platform_name in ("x11", "wayland"), "BEASTCORD_OZONE_PLATFORM must be x11 or wayland")
+        require(os.environ.get("BEASTCORD_SOFTWARE_RENDERING", "0") in ("0", "1"), "BEASTCORD_SOFTWARE_RENDERING must be 0 or 1")
+        for key in ("ELECTRON_RUN_AS_NODE", "NODE_OPTIONS", "NODE_PATH", "ELECTRON_OZONE_PLATFORM_HINT", "LD_PRELOAD", "LD_LIBRARY_PATH"):
+            os.environ.pop(key, None)
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+        font = self.state / "fonts.conf"
+        atomic_write(font, b'<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd"><fontconfig><dir>/usr/local/share/fonts</dir><dir prefix="xdg">fonts</dir><dir>~/.fonts</dir><cachedir prefix="xdg">beastcord/fontconfig</cachedir></fontconfig>')
+        os.environ.update(FONTCONFIG_FILE=str(font), ELECTRON_IS_DEV="0", NODE_ENV="production")
+        flags = ["--disable-features=WaylandDmabuf"] if platform_name == "wayland" else ["--use-gl=angle", "--use-angle=gl", "--disable-features=Vulkan"]
+        if os.environ.get("BEASTCORD_SOFTWARE_RENDERING", "0") == "1":
+            os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            flags += ["--disable-gpu", "--disable-gpu-compositing"]
+            print("Software rendering requested (GPU acceleration disabled).")
+        print(f"Launching {target} ({platform_name}); bounded output: {self.state}/startup.log", flush=True)
+        environment = os.environ.copy()
+        compatibility = drm_compatibility(self.state)
+        if compatibility:
+            environment["LD_PRELOAD"] = compatibility
+        rc = run(str(self.base), str(self.state / "startup.log"), str(self.base / target / hostdir / "Discord"), ["--no-sandbox", "--no-zygote", "--ozone-platform=" + platform_name, *flags, *args], child_env=environment)
+        print(f"Discord exited with status {rc}; inspect startup logs locally (they may contain private data).")
+        return rc
+
+    def doctor(self):
+        print(f"System: {platform.system()} {platform.machine()}")
+        print(f"Managed data: {self.base}")
+        print(f"Startup logs: {self.state}/startup.log and startup.log.1 (512 KiB each)")
+        for name in ("fetch", "pkg", "sysctl", "xprop", "xwininfo", "wmctrl"):
+            print(name + ": " + ("available" if shutil.which(name) else "missing"))
+        if shutil.which("sysctl"):
+            subprocess.run(["sysctl", "compat.linux.osrelease"], check=False)
+        for name in ("proc/version", "sys/kernel", "dev/shm", "lib64/ld-linux-x86-64.so.2", "dev/dri/card0", "dev/dri/renderD128"):
+            path = Path("/compat/linux") / name
+            print(("OK: " if path.exists() else "MISSING: ") + str(path))
+        packages = "linux_base-rl9 linux-rl9-alsa-plugins-oss linux-rl9-alsa-plugins-pulseaudio linux-rl9-alsa-lib linux-rl9-at-spi2-atk linux-rl9-atk linux-rl9-ca-certificates linux-rl9-cups-libs linux-rl9-dbus-libs linux-rl9-gtk3 linux-rl9-imageformats-libs linux-rl9-libdrm linux-rl9-libva linux-rl9-nspr linux-rl9-nss linux-rl9-opus linux-rl9-dri pulseaudio".split()
+        if shutil.which("pkg"):
+            for package in packages:
+                if subprocess.run(["pkg", "info", "-e", package], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                    print("Missing package: " + package)
+        print("Display: DISPLAY=" + os.environ.get("DISPLAY", "unset") + ", WAYLAND_DISPLAY=" + os.environ.get("WAYLAND_DISPLAY", "unset"))
+        print("Session D-Bus: " + ("set" if os.environ.get("DBUS_SESSION_BUS_ADDRESS") else "unset"))
+        if (self.base / "current").is_symlink():
+            target, _ = self.version()
+            print("Current: " + target)
+            print("Mode: " + ("Equicord" if (self.base / target / "equicord").is_file() else "unmodified archive host"))
+        else:
+            print("No managed current version")
+        if (self.base / "previous").is_symlink():
+            print("Previous: " + os.readlink(self.base / "previous"))
+        print("The persistent .lock uses flock; process exit releases it. Do not delete it.")
+        print("Sandbox: disabled for Linuxulator. Rollback does not control host/module self-updates.")
+
+
+def parse_cli(argv):
+    parser = argparse.ArgumentParser(prog="beastcord", usage="beastcord [--launch [Discord options...]] | --install | --update | --repair-equicord | --rollback | --doctor", description="Install defaults to Equicord; updates preserve mode. Close clients before maintenance.")
+    if not argv:
+        return "launch", None, None, []
+    action = argv[0]
+    if action == "--launch":
+        return "launch", None, None, argv[1:]
+    if action in ("--help", "-h"):
+        parser.print_help()
+        return "help", None, None, []
+    require(action in ("--install", "--update", "--repair-equicord", "--rollback", "--doctor"), "unknown action: " + action)
+    if action in ("--install", "--update"):
+        parser.add_argument("--archive")
+        modes = parser.add_mutually_exclusive_group()
+        modes.add_argument("--equicord", dest="mod", action="store_const", const=True)
+        modes.add_argument("--vanilla", dest="mod", action="store_const", const=False)
+        options = parser.parse_args(argv[1:])
+        return action[2:], options.archive, options.mod, []
+    require(len(argv) == 1, "unexpected arguments")
+    return action[2:], None, None, []
+
+
+def main(argv=None):
+    os.umask(0o077)
+    try:
+        action, archive, mod, args = parse_cli(sys.argv[1:] if argv is None else argv)
+        if action == "help":
+            return 0
+        manager = Manager()
+        if action == "doctor":
+            manager.doctor()
+            return 0
+        manager.prerequisites()
+        manager.prepare()
+        if action == "launch":
+            return manager.launch(args)
+        with held_lock(manager.base / ".lock"):
+            manager.maintain(action, archive, mod)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except (LaunchError, OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as exc:
+        print("beastcord: " + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
